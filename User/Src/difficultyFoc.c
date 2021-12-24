@@ -152,7 +152,7 @@ int DiffcultyFOCAlignSendor(motor_t *device,magnetic_sensor_t *sensor)
 	}
 	else if (sensor_val[0] > sensor_val[1])
 	{
-		printf("[FOC] sensor direction is CW\r\n");
+		LOG_PRINTF(LOG_INFO,"[FOC] sensor direction is CW\r\n");
 		device->sensor_dir = kSensorCW;
 	}
 

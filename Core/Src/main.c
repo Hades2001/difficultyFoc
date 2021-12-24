@@ -37,6 +37,7 @@
 #include <math.h>
 #include "userTimer.h"
 #include "user_serial.h"
+#include "setupInf.h"
 
 /* USER CODE END Includes */
 
@@ -67,6 +68,7 @@ void SystemClock_Config(void);
 extern serial_t serial;
 extern motor_t motor;
 extern magnetic_sensor_t tle5012;
+extern setupinf_t setup;
 
 /* USER CODE END PFP */
 
@@ -80,7 +82,7 @@ int fputc(int c, FILE *stream)
 	return 1;
 }
 
-typedef struct
+typedef struct pid_controller
 {
 	float p;
 	float i;
@@ -89,17 +91,45 @@ typedef struct
 	float error_prev;
 	float output_prev;
 	float integral_prev;
+	float output_rmap;
+	uint64_t time_prve;
 
 	float limit_up;
 	float limit_down;
 } pid_controller_t;
 
-typedef struct
+typedef struct FO_filter
 {
 	float lase;
 	float alpha;
 	float _alpha_n;
 } FO_filter_t;
+
+typedef struct system
+{
+	system_state_t state;
+    
+    float motor_p;
+    float error;
+    float target;
+
+	float angle_now;
+	float velocity_now;
+	float elecangle_now;
+
+	pid_controller_t velocity_pid;
+	pid_controller_t angle_pid;
+	pid_controller_t current_pid;
+
+	float* used_parm;
+	pid_controller_t* used_pid;
+
+	//************************
+	int8_t setupstate;
+
+} system_t;
+
+system_t sys;
 
 #define DECLARE_FO_FILTER(name, alpha) FO_filter_t name = {0, alpha, (1 - alpha)}
 
@@ -114,7 +144,8 @@ void initFOFilter(FO_filter_t *p, float alpha)
 }
 float FOFilter(FO_filter_t *p, float data)
 {
-	return (data * p->alpha + (p->_alpha_n) * p->lase);
+	p->lase = (data * p->alpha + (p->_alpha_n) * p->lase);
+	return p->lase;
 }
 
 void PIDInit(pid_controller_t *parm)
@@ -133,7 +164,7 @@ void PIDInit(pid_controller_t *parm)
 	parm->limit_down = FLT_MIN;
 }
 
-void PIDInitWithParm(pid_controller_t *parm, float _p, float _i, float _d)
+void PIDInitWithParm(pid_controller_t *parm, float _p, float _i, float _d,float _up, float _down, float _remap)
 {
 	if (parm == NULL)
 		return;
@@ -141,15 +172,22 @@ void PIDInitWithParm(pid_controller_t *parm, float _p, float _i, float _d)
 	parm->i = _i;
 	parm->d = _d;
 
+	parm->limit_up = _up;
+	parm->limit_down = _down;
+	parm->output_rmap = _remap;
+
 	parm->error_prev = 0;
 	parm->output_prev = 0;
 	parm->integral_prev = 0;
+	parm->output_rmap = 0;
+	parm->time_prve = sys_ticks.micros();
 }
 
-void PIDSetLimit(pid_controller_t *parm, float _up, float _down)
+void PIDSetLimit(pid_controller_t *parm, float _up, float _down, float _remap)
 {
 	parm->limit_up = _up;
 	parm->limit_down = _down;
+	parm->output_rmap = _remap;
 }
 
 void PIDSetParm(pid_controller_t *parm, float _p, float _i, float _d)
@@ -164,32 +202,36 @@ void PIDSetParm(pid_controller_t *parm, float _p, float _i, float _d)
 
 float PIDOperate(pid_controller_t *parm, float error)
 {
+	uint64_t time = sys_ticks.micros();
+	float deltaTs = ( time - parm->time_prve ) * 1e-6;
+	if(( deltaTs <= 0.0f )||( deltaTs > 0.5f )) deltaTs = 0.001;
+
 	float proportional = parm->p * error;
-	float integral = parm->integral_prev + parm->i * (error + parm->error_prev);
+	float integral = parm->integral_prev + parm->i * deltaTs * 0.5f *(error + parm->error_prev);
 	integral = _CONSTRAIN(integral, parm->limit_down, parm->limit_up);
-	float derivative = parm->d * (error - parm->error_prev);
+
+	float derivative = parm->d * (error - parm->error_prev) / deltaTs;
 	float output = proportional + integral + derivative;
+
 	output = _CONSTRAIN(output, parm->limit_down, parm->limit_up);
+
+	if( parm->output_rmap > 0 )
+	{
+        float output_rate = (output - parm-> output_prev) / deltaTs;
+        if (output_rate > parm->output_rmap)
+            output = parm->output_prev + parm->output_rmap * deltaTs;
+        else if (output_rate < -parm->output_rmap)
+            output = parm->output_prev - parm->output_rmap * deltaTs;
+	}
 
 	parm->error_prev = error;
 	parm->integral_prev = integral;
 	parm->output_prev = output;
+	parm->time_prve = time;
 
 	return output;
 }
 
-pid_controller_t global_pid;
-
-void testEEPROM()
-{
-	
-	uint8_t read_buff[10];
-	HAL_I2C_Mem_Write(&hi2c2, 0x00a0, 0, I2C_MEMADD_SIZE_8BIT, "Fuck stc", 8, 100);
-	HAL_Delay(10);
-	memset(read_buff, '\0', sizeof(read_buff));
-	HAL_I2C_Mem_Read(&hi2c2, 0x00a1, 0, I2C_MEMADD_SIZE_8BIT, read_buff, 8, 100);
-	printf("Read from EEPROM is %s\r\n", read_buff);
-}
 uint32_t adc_val_dma[10];
 
 void configADCDMA()
@@ -219,28 +261,14 @@ uint8_t inRangeF(float value, float down, float up)
 	return ((value >= down) && (value <= up)) ? 1 : 0;
 }
 
-uint8_t tx_buff[256];
-void uartDMATransmit(uint8_t *data,uint8_t length)
+void sendMotorParm(float sensorAngle,float velocity,uint32_t current)
 {
-	memcpy(tx_buff,data,sizeof(uint8_t)*length);
-	LL_DMA_SetMemoryAddress(DMA1, LL_DMA_CHANNEL_2,(uint32_t)(tx_buff));
-	LL_DMA_SetPeriphAddress(DMA1, LL_DMA_CHANNEL_2,LL_USART_DMA_GetRegAddr(USART2,LL_USART_DMA_REG_DATA_TRANSMIT));
-	LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_2, length);
-	LL_USART_EnableDMAReq_TX(USART2);
-	
-	LL_DMA_DisableChannel(DMA1,LL_DMA_CHANNEL_2);
-	LL_DMA_SetDataLength(DMA1,LL_DMA_CHANNEL_2,length);
-	LL_DMA_EnableChannel(DMA1, LL_DMA_CHANNEL_2);
-}
-
-void sendMotorParm(float sensorAngle,float velocity,float current)
-{
-	uint32_t sendbuff[3] = {
+	volatile uint32_t sendbuff[3] = {
 		*(uint32_t*)&sensorAngle,
 		*(uint32_t*)&velocity,
 		*(uint32_t*)&current,
 	};
-	serial.sendPack(0x11,sizeof(sendbuff),(void*)sendbuff);
+	serial.sendPack(0xff,0x11,sizeof(sendbuff),(void*)sendbuff);
 }
 
 void sendDebugMessage(const char *format, ...)
@@ -249,8 +277,78 @@ void sendDebugMessage(const char *format, ...)
 	va_list ap;
 	va_start(ap,format);
 	int length = vsprintf(str_buff,format,ap);
-	serial.sendPack(0x31,length,(void*)str_buff);
+	serial.sendPack(0xff,0x31,length,(void*)str_buff);
 	va_end(ap);
+}
+
+float parm2Angle(uint8_t *p)
+{
+	volatile uint8_t databuff_0[8];//0x20000CB4
+	memcpy((uint8_t*)databuff_0,(uint8_t*)p,sizeof(uint8_t)*8);
+	volatile int32_t circle = *(int32_t*)&databuff_0[0]; // 0x00000000
+	volatile int32_t angle = *(int32_t*)&databuff_0[4];  // 0x200003CC
+	volatile float anglef = *(float*)&angle;
+	return (float)circle * _2PI + anglef;
+}
+
+float parm2Velocity(uint8_t *p)
+{
+	return *(float*)&p[0];
+}
+
+void serialReceive()
+{
+	if(serial.isAvailable() > 0 )
+	{
+		uint8_t flag = 0;
+		uint8_t mode_change_flag = 0;
+		uint8_t id = serial.revice_pack.id;
+		switch( serial.revice_pack.cmd )
+		{
+			case CMD_SET_IDLE : 
+				sys.state = STATE_IDLE;
+				sys.target = 0.0f;
+				sys.used_pid = &sys.angle_pid;
+				sys.used_parm = &sys.angle_now;	
+				mode_change_flag = 1;
+				break;
+			case CMD_SET_VELOCITY : 
+				sys.state = STATE_VELOCITY;
+				sys.target = parm2Velocity(&serial.revice_pack.data[0]);
+				sys.used_pid = &sys.velocity_pid;
+				sys.used_parm = &sys.velocity_now;	
+				mode_change_flag = 1;
+				break;
+			case CMD_SET_ANGLE : 
+				sys.state = STATE_ANGLE;
+				sys.target = parm2Angle(&serial.revice_pack.data[0]);
+				sys.used_pid = &sys.angle_pid;
+				sys.used_parm = &sys.angle_now;	
+				mode_change_flag = 1;	
+				break;
+		}
+		serial.sendPack(id,0x00,1,&flag);
+		serial.clearRDFlag();
+
+		if( mode_change_flag == 1 )
+		{
+			sys.error = 0.0f;
+			sys.motor_p = 0.0f;
+		}
+	}
+}
+
+DECLARE_FO_FILTER(angle_LPF,0.9);
+DECLARE_FO_FILTER(velocity_LPF,0.2);
+
+void testEEPROM()
+{
+	uint8_t read_buff[10];
+	HAL_I2C_Mem_Write(&hi2c2, 0x00a0, 0, I2C_MEMADD_SIZE_8BIT, "Fuck stc", 8, 100);
+	HAL_Delay(10);
+	memset(read_buff, '\0', sizeof(read_buff));
+	HAL_I2C_Mem_Read(&hi2c2, 0x00a1, 0, I2C_MEMADD_SIZE_8BIT, read_buff, 8, 100);
+	serial.printf("[FOC] Read from EEPROM is %s\r\n", read_buff);
 }
 
 /* USER CODE END 0 */
@@ -274,22 +372,22 @@ int main(void)
   /* USER CODE END Init */
 
   /* Configure the system clock */
-  SystemClock_Config();
+  	SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_SPI1_Init();
-  MX_TIM1_Init();
-  MX_USART2_UART_Init();
-  MX_TIM3_Init();
-  MX_TIM14_Init();
-  MX_ADC1_Init();
-  MX_I2C2_Init();
+	MX_GPIO_Init();
+	MX_DMA_Init();
+	MX_SPI1_Init();
+	MX_TIM1_Init();
+	MX_USART2_UART_Init();
+	MX_TIM3_Init();
+	MX_TIM14_Init();
+	MX_ADC1_Init();
+	MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
 
 
@@ -307,41 +405,76 @@ int main(void)
     LL_TIM_EnableAllOutputs(TIM1);
 
 	LL_SPI_Enable(SPI1);
-	initSensor(&tle5012);
-
 	initTicks(TIM14);
+
 	LL_TIM_EnableIT_UPDATE(TIM14);
 	LL_TIM_EnableCounter(TIM14);
 
 	InitTransmission(USART2);
-
+	initSetupInfo();
+	initSensor(&tle5012);
 
 	//configADCDMA();
 	//testEEPROM();
-
 	//HAL_ADC_Start(&hadc1);
-
 	//HAL_ADC_Start_DMA(&hadc1, &adc_val_dma[0], 1);
 
 	motor.voltage_dc = 12.0;
 	motor.voltage_limit = 10.0;
 	DifficultyFOCInit(&motor);
 
-	PIDInitWithParm(&global_pid, 1.0f, 0.0f, 0.0f);
-	PIDSetLimit(&global_pid, 2520.0f, -2520.0f);
+
+	PIDInitWithParm(&sys.velocity_pid, 	0.09f, 1.0f, 0.0f, 5.0f, -5.0f, 1000.0f);
+	PIDInitWithParm(&sys.angle_pid, 	5.0f,  0.0f, 0.0f, 5.0f, -5.0f, 0.0f);
+	PIDInitWithParm(&sys.current_pid, 	1.0f,  0.0f, 0.0f, 5.0f, -5.0f, 0.0f);
 
 	LL_mDelay(100);
 
-	serial.printf("[FOC] Start time %lld\r\n", sys_ticks.micros());
-	DiffcultyFOCAlignSendor(&motor, &tle5012);
-	serial.printf("[FOC] End time %lld\r\n",sys_ticks.micros());
+	sys.setupstate = setup.readFromE2prom();
+	if( sys.setupstate != 0 )
+	{
+		if( sys.setupstate == -1 ) 
+			serial.printf("[FOC] read eeprom fault\r\n");
+		
+		serial.printf("[FOC] Start time %lld\r\n", sys_ticks.micros());
+		DiffcultyFOCAlignSendor(&motor, &tle5012);
+		serial.printf("[FOC] End time %lld\r\n",sys_ticks.micros());
+		if( sys.setupstate == -2 )
+		{
+			setup.data.zero_elec_angle = motor.zero_elec_angle;
+			setup.writeToE2prom();
+		}
+	}
+	else
+	{
+		serial.printf("[FOC] zero elec Angle = %.2f\r\n", _R2D(setup.data.zero_elec_angle));
+		serial.printf("[FOC] zero offset %.2f\r\n", _R2D(setup.data.zero_offset));
+		motor.zero_elec_angle = setup.data.zero_elec_angle;
+		motor.sensor_dir = kSensorCW;
 
-	float electrical_angle = getElectricaAngle(&motor, &tle5012);
-	float motor_p = 1.0f;
-	float target = _D2R(120);
-	float angle_error = 0.0f;
-	uint64_t timepoint = 0;
+		tle5012.angle_offset = _D2R(60);
+	}
+		
+	updataSensor(&tle5012);
+	angle_LPF.lase = getAngle(&tle5012);
+	velocity_LPF.lase = getVelocity(&tle5012);
 
+	sys.error = 0.0f;
+	sys.state = STATE_IDLE;
+	sys.target = 0.0f;
+	sys.motor_p = 0.0f;
+	
+	sys.angle_now = getAngle(&tle5012);
+	sys.velocity_now = getVelocity(&tle5012);
+
+	sys.used_pid = &sys.angle_pid;
+	sys.used_parm = &sys.angle_now;
+
+	sys.elecangle_now = getElectricaAngle(&motor, &tle5012);
+	DifficultySeting(sys.motor_p, 0.0f, sys.elecangle_now, &motor);
+	setTimerPWMVal(&motor);
+
+	sendMotorParm(1.25f,2.54f,0.0f);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -353,72 +486,38 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-		timepoint = sys_ticks.micros();
 		updataSensor(&tle5012);
-		angle_error = target - getAngle(&tle5012);
-		motor_p = PIDOperate(&global_pid, angle_error);
-		motor_p = _CONSTRAIN(motor_p, -1.0f, 1.0f);
-		electrical_angle = getElectricaAngle(&motor, &tle5012);
-		DifficultySeting(motor_p, 0.0f, electrical_angle, &motor);
-		setTimerPWMVal(&motor);
-		sendMotorParm(getAngle(&tle5012),0.0f,0.0f);
-		//serial.printf("[FOC] Cycle time %lld\r\n", sys_ticks.micros() - timepoint);
 		
-	/*
-		updataSensor(&tle5012);
-		LL_mDelay(100);
-		printf("Angle : %.2f\r\n",_R2D(getAngle(&tle5012)));
-		*/
-		/*
-		if( serial.isAvailable() > 0 )
-		{
-			printf("revicd data %s\r\n",serial.revice_pack.data);
-			serial.available = 0;
-		}
-		*/
-		//readADC();
+		sys.angle_now = FOFilter(&angle_LPF,getAngle(&tle5012));
+		sys.velocity_now = FOFilter(&velocity_LPF,getVelocity(&tle5012));
 
-		/*
-		updataSensor(&tle5012);
-		if( inRangeF(getAngle(&tle5012),_D2R(10),_D2R(30)))
+		if( sys.state != STATE_IDLE )
 		{
-			if( tle5012.dir == 1 )
-			{
-				angle_error = ( _D2R(10) - fabs(( getAngle(&tle5012) - _D2R(20)))) * 10.0f;
-				printf("angle_error = %.2f\r\n",angle_error);
-			}
-			//else if( tle5012.dir == -1 )
-			//{
-			//	angle_error = ( getAngle(&tle5012) - _D2R(10)) * 5.0f;
-			//}
-			motor_p = _CONSTRAIN( angle_error ,-2.0f,2.0f);
-
+			sys.error = sys.target - *sys.used_parm;
+			sys.motor_p = PIDOperate(sys.used_pid, sys.error);
+			sys.elecangle_now = getElectricaAngle(&motor, &tle5012);
+			DifficultySeting(sys.motor_p, 0.0f, sys.elecangle_now, &motor);
+			setTimerPWMVal(&motor);
 		}
 		else
 		{
-			motor_p = 0.0f;
+			DifficultySeting(0.0f, 0.0f, sys.elecangle_now, &motor);
+			setTimerPWMVal(&motor);
 		}
-		electrical_angle = getElectricaAngle(&motor,&tle5012);
-		DifficultySeting(-motor_p, 0.0f, electrical_angle, &motor);
+		//getanglespeed(&tle5012);
+		
+		serialReceive();
+		sendMotorParm(sys.angle_now,sys.velocity_now,tle5012.vel_sendor);
+
+		/*
+		velocity_error = ( velocity_target - velocity_af );
+		motor_p = PIDOperate(&global_pid, velocity_error);
+		motor_p = _CONSTRAIN(motor_p, -5.0f, 5.0f);
+		electrical_angle = getElectricaAngle(&motor, &tle5012);
+		DifficultySeting(motor_p, 0.0f, electrical_angle, &motor);
 		setTimerPWMVal(&motor);
 		*/
-		//readADC();
-
-		/*
-	sensor_read = getAngleR() - sensorAngle;
-	sensor_read = ( sensor_read > 0 ) ? sensor_read : ( 2520.0 + sensor_read );
-	sensor_read = ( sensor_read > 1260 ) ? ( sensor_read - 2520 ) : sensor_read;
-
-	angle_erroe = angle_set - sensor_read;
-
-	angle_out = sensor_read + PIDOperate(&global_pid,angle_erroe);
-	DifficultySeting(1.0,0.0,((float)( fmod(angle_out, 360 ))) * _PI / 180,&motor);
-	setTimerPWMVal(&motor);
-	printf("Angle : %.2f,%.2f\r\n",sensor_read,angle_out);
-	*/
-		/*
-
-		*/
+		//LL_mDelay(100);
 	}
   /* USER CODE END 3 */
 }

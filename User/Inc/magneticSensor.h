@@ -18,16 +18,22 @@
 #define SPI_TX_MODE 0
 #define SPI_RX_MODE 1
 
+#define SYSTEM_ERROR_MASK           0x4000
+#define INTERFACE_ERROR_MASK        0x2000
+#define INV_ANGLE_ERROR_MASK        0x1000
+
 typedef struct
 {
 	float angle_last;
 	float angle_new;
+	float angle_offset;
 
 	float velocity;
 
 	uint64_t vel_time;
 	uint64_t vel_time_last;
-	int vel_angle_last;
+	float vel_sendor;
+	float vel_angle_last;
 	int vel_circle_last;
 	int circle;
 	int8_t dir;
@@ -45,6 +51,7 @@ typedef enum
 
 extern int initSensor(magnetic_sensor_t *sensor);
 extern int updataSensor(magnetic_sensor_t *sensor);
+extern float getVelocity(magnetic_sensor_t *sensor);
 extern float getAngle(magnetic_sensor_t *sensor);
 extern float getMechanicalAngle(magnetic_sensor_t *sensor);
 

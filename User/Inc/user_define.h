@@ -19,4 +19,32 @@
 
 #define LOG_PRINTF(t,c,...) serial.log(0,c,##__VA_ARGS__)
 
+
+typedef enum{
+	CMD_READ_ALL            = 0x25,
+
+	CMD_SET_IDLE            = 0x90,
+	CMD_SET_VELOCITY        = 0x91,
+	CMD_SET_ANGLE           = 0x92,
+
+	CMD_SET_ALL             = 0xA0,
+	CMD_SET_SENSOR_OFFSET   = 0xA1,
+	CMD_SET_DC              = 0xA2,
+	CMD_SET_VOUT_LIMIT      = 0xA3,
+
+	CMD_SET_VELOCITY_PID    = 0xB1,
+	CMD_SET_ANGLE_PID       = 0xB2,
+}pack_cmd_t;
+
+
+typedef enum{
+    STATE_IDLE = 0,
+    STATE_ANGLE,
+    STATE_VELOCITY,
+    STATE_WRITE_BUSY,
+}system_state_t;
+
+
+
+
 #endif

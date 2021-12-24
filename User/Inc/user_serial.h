@@ -27,7 +27,7 @@ enum {
 
 typedef struct transmission_pack
 {
-    uint8_t dir;
+    uint8_t id;
     uint8_t cmd;
     uint8_t length;
     uint8_t *data;
@@ -48,8 +48,9 @@ typedef struct
     transmission_pack_t revice_pack;
 
     int16_t (*isAvailable)();
+    void (*clearRDFlag)();
     int (*revicePack)(transmission_pack_t *pack_ptr);
-    void (*sendPack)(uint8_t cmd,uint8_t length,void *data);
+    void (*sendPack)(uint8_t id,uint8_t cmd,uint8_t length,void *data);
     void (*printf)(const char *format, ...);
     void (*log)(int type,const char *format, ...);
 
@@ -60,7 +61,7 @@ void InitTransmission(USART_TypeDef *huart);
 
 int16_t _isAvailable(void);
 int _revicePack(transmission_pack_t *pack_ptr);
-void _sendPack(uint8_t cmd,uint8_t length,void *data);
+void _sendPack(uint8_t id,uint8_t cmd,uint8_t length,void *data);
 
 extern serial_t serial;
 

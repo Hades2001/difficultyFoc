@@ -201,14 +201,29 @@ void USART2_IRQHandler(void)
       usartIRQCB(LL_USART_ReceiveData8(USART2));
       //LL_USART_RequestRxDataFlush(USART2);
   }
+  if( LL_USART_IsActiveFlag_CM(USART2))
+  {
+      LL_USART_ClearFlag_CM(USART2);
+  }
   if(LL_USART_IsActiveFlag_IDLE(USART2))
   {
     LL_USART_ClearFlag_IDLE(USART2); 
   }
   if(LL_USART_IsActiveFlag_TC(USART2))
   {
-      LL_USART_ClearFlag_TC(USART2); 
+      LL_USART_DisableIT_TC(USART2);
+      //LL_USART_ClearFlag_TC(USART2); 
+      LL_DMA_DisableChannel(DMA1,LL_DMA_CHANNEL_2);
+
+      //0x00620090
+      //LL_USART_ClearFlag_TCBGT(USART2);
+      //LL_USART_ClearFlag_IDLE(USART2);
+      //LL_USART_ClearFlag_CM(USART2);
+
+      //Check if the USART Transmit Enable Acknowledge Flag is set or not
+      //Check if the USART Receive Enable Acknowledge Flag is set or not
   }
+  
   /* USER CODE END USART2_IRQn 0 */
   /* USER CODE BEGIN USART2_IRQn 1 */
 

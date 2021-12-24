@@ -2,7 +2,6 @@
 
 serial_t serial;
 
-// X^8+X^2+X^1+1
 const uint8_t crc8_table[256] =
     {
         0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15, 0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
@@ -38,7 +37,7 @@ void usartIRQCB(uint8_t data)
         break;
     case kSerial_DIR:
         serial.revice_pack.crc = 0;
-        serial.revice_pack.dir = data;
+        serial.revice_pack.id = data;
         CALA_CRC(serial.revice_pack.crc, data);
         serial.state = kSerial_CMD;
         break;
@@ -82,34 +81,50 @@ int16_t _isAvailable(void)
     return (serial.available == 1) ? serial.revice_pack.length : -1;
 }
 
+void clearReadReadyFlag()
+{
+    serial.available = 0;
+}
+
 int _revicePack(transmission_pack_t *pack_ptr)
 {
     if (pack_ptr == NULL)
         return -1;
     if (serial.available != 1)
         return -1;
-    memset((void *)serial.revice_pack.data,0,sizeof(uint8_t)*256);
+    
     memcpy((void *)pack_ptr, (void *)&serial.revice_pack, sizeof(transmission_pack_t));
+    if( serial.revice_pack.length > 0 )
+        memcpy((void *)pack_ptr->data, (void *)&serial.revice_pack.data, (size_t)serial.revice_pack.length);
+
+    memset((void *)serial.revice_pack.data,0,sizeof(uint8_t)*256);
     return 0;
 }
 
-void _sendPack(uint8_t cmd, uint8_t length, void *data)
+void _sendPack(uint8_t id,uint8_t cmd, uint8_t length, void *data)
 {
-    while (LL_USART_IsActiveFlag_TC(USART2) == 0) LL_mDelay(1);
+    while (LL_USART_IsActiveFlag_TC(USART2) == 0UL) LL_mDelay(1);
     LL_DMA_ClearFlag_TC2(DMA1);
 
+    uint8_t crc = 0;
     uint8_t *data_ptr = (uint8_t *)data;
-    serial.tx_buff[0] = 0xAA;
+    serial.tx_buff[0] = 0xAA;   
     serial.tx_buff[1] = 0x55;
-    serial.tx_buff[2] = TRANSMISSION_DIR_M2P;
+    serial.tx_buff[2] = id;
     serial.tx_buff[3] = cmd;
     serial.tx_buff[4] = length;
-    
+
+    for (int i = 0; i < 5; i++)
+    {
+        crc = CALA_CRC(crc, serial.tx_buff[i]);
+    }
+
     for (int i = 0; i < length; i++)
     {
         serial.tx_buff[5+i] = data_ptr[i];
+        crc = CALA_CRC(crc,serial.tx_buff[5+i]);
     }
-    serial.tx_buff[5+length + 0] = 0x00;
+    serial.tx_buff[5+length + 0] = crc;
     serial.tx_buff[5+length + 1] = 0xee;
 
     LL_DMA_DisableChannel(DMA1,LL_DMA_CHANNEL_2);
@@ -123,7 +138,7 @@ void _serial_printf(const char *format, ...)
 	va_list ap;
 	va_start(ap,format);
 	int length = vsprintf(str_buff,format,ap);
-	serial.sendPack(0x30,length,(void*)str_buff);
+	serial.sendPack(0xff,0x30,length,(void*)str_buff);
 	va_end(ap);
 }
 
@@ -133,7 +148,7 @@ void _serial_log(int type,const char *format, ...)
 	va_list ap;
 	va_start(ap,format);
 	int length = vsprintf(str_buff,format,ap);
-	serial.sendPack(0x31+type,length,(void*)str_buff);
+	serial.sendPack(0xff,0x31+type,length,(void*)str_buff);
 	va_end(ap);
 }
 
@@ -146,6 +161,8 @@ void InitTransmission(USART_TypeDef *huart)
     serial.available = 0;
 
     serial.isAvailable = &_isAvailable;
+    serial.clearRDFlag = &clearReadReadyFlag;
+
     serial.revicePack = &_revicePack;
     serial.sendPack = &_sendPack;
     serial.printf = &_serial_printf;
